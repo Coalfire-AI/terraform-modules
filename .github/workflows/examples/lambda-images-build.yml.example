@@ -1,0 +1,374 @@
+# Lambda Container Image Build Workflow
+#
+# Builds and pushes Docker images for Lambda functions to ECR.
+# Images are tagged with git SHA for traceability and immutability.
+#
+# Prerequisites:
+# 1. GitHub OIDC provider configured in AWS
+# 2. IAM role with ECR push permissions
+# 3. ECR repositories created (by Terraform or manually)
+#
+# Usage:
+# - Push to main -> Builds and pushes with :latest and :sha-<commit>
+# - Push to staging -> Builds and pushes with :staging and :sha-<commit>
+# - Pull requests -> Builds only (no push) to validate
+# - Manual trigger -> Build specific modules with custom tag
+
+name: Lambda Images Build
+
+on:
+  push:
+    branches:
+      - main
+      - staging
+    paths:
+      - 'modules/preprocessing_lambda/**'
+      - 'modules/chunk_metadata_transformer/**'
+      - 'modules/bedrock_knowledge_base/s3_vectors/extractors/**'
+      - '.github/workflows/lambda-images-build.yml'
+  pull_request:
+    branches:
+      - main
+      - staging
+    paths:
+      - 'modules/preprocessing_lambda/**'
+      - 'modules/chunk_metadata_transformer/**'
+      - 'modules/bedrock_knowledge_base/s3_vectors/extractors/**'
+  workflow_dispatch:
+    inputs:
+      module:
+        description: 'Module to build'
+        required: true
+        type: choice
+        options:
+          - all
+          - preprocessing_lambda
+          - chunk_metadata_transformer
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+      image_tag:
+        description: 'Custom image tag (optional, defaults to git SHA)'
+        required: false
+        type: string
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+jobs:
+  # ============================================================================
+  # Detect Changes
+  # ============================================================================
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      preprocessing_lambda: ${{ steps.filter.outputs.preprocessing_lambda }}
+      chunk_metadata_transformer: ${{ steps.filter.outputs.chunk_metadata_transformer }}
+      extractors: ${{ steps.filter.outputs.extractors }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            preprocessing_lambda:
+              - 'modules/preprocessing_lambda/**'
+            chunk_metadata_transformer:
+              - 'modules/chunk_metadata_transformer/**'
+            extractors:
+              - 'modules/bedrock_knowledge_base/s3_vectors/extractors/**'
+
+  # ============================================================================
+  # Build Preprocessing Lambda Image
+  # ============================================================================
+  build-preprocessing:
+    name: Build Preprocessing Lambda
+    needs: changes
+    if: |
+      github.event_name == 'workflow_dispatch' && (inputs.module == 'all' || inputs.module == 'preprocessing_lambda') ||
+      (github.event_name != 'workflow_dispatch' && (needs.changes.outputs.preprocessing_lambda == 'true' || needs.changes.outputs.extractors == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine environment and role
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENV="prod"
+          elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            ENV="staging"
+          else
+            ENV="dev"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+
+          # Map environment to secret name
+          case $ENV in
+            prod) echo "role_secret=AWS_ROLE_ARN_PROD" >> $GITHUB_OUTPUT ;;
+            staging) echo "role_secret=AWS_ROLE_ARN_STAGING" >> $GITHUB_OUTPUT ;;
+            *) echo "role_secret=AWS_ROLE_ARN_DEV" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[steps.env.outputs.role_secret] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Sync extractors
+        run: |
+          echo "Syncing extractors from shared location..."
+          rm -rf modules/preprocessing_lambda/src/extractors
+          cp -r modules/bedrock_knowledge_base/s3_vectors/extractors modules/preprocessing_lambda/src/extractors
+          find modules/preprocessing_lambda/src/extractors -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          echo "Extractors synced successfully"
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+          # Determine tag
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            TAG="sha-${SHORT_SHA}"
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+          # Build tags list
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            REPO="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPO_PREPROCESSING || 'preprocessing-lambda' }}"
+            TAGS="$REPO:$TAG"
+
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              TAGS="$TAGS,$REPO:latest"
+            elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+              TAGS="$TAGS,$REPO:staging"
+            fi
+
+            echo "tags=$TAGS" >> $GITHUB_OUTPUT
+            echo "repository=$REPO" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: modules/preprocessing_lambda
+          file: modules/preprocessing_lambda/docker/Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.timestamp }}
+            module=preprocessing_lambda
+
+      - name: Output image URI
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "## Preprocessing Lambda Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | \`${{ steps.meta.outputs.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Full URI | \`${{ steps.meta.outputs.repository }}:${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage in Terraform" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+          echo "module \"preprocessing_lambda\" {" >> $GITHUB_STEP_SUMMARY
+          echo "  source = \"./modules/preprocessing_lambda\"" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "  image_uri   = \"${{ steps.meta.outputs.repository }}:${{ steps.meta.outputs.tag }}\"" >> $GITHUB_STEP_SUMMARY
+          echo "  build_image = false" >> $GITHUB_STEP_SUMMARY
+          echo "  # ..." >> $GITHUB_STEP_SUMMARY
+          echo "}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Build Chunk Metadata Transformer Image
+  # ============================================================================
+  build-chunk-transformer:
+    name: Build Chunk Metadata Transformer
+    needs: changes
+    if: |
+      github.event_name == 'workflow_dispatch' && (inputs.module == 'all' || inputs.module == 'chunk_metadata_transformer') ||
+      (github.event_name != 'workflow_dispatch' && (needs.changes.outputs.chunk_metadata_transformer == 'true' || needs.changes.outputs.extractors == 'true'))
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine environment and role
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENV="prod"
+          elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+            ENV="staging"
+          else
+            ENV="dev"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+
+          case $ENV in
+            prod) echo "role_secret=AWS_ROLE_ARN_PROD" >> $GITHUB_OUTPUT ;;
+            staging) echo "role_secret=AWS_ROLE_ARN_STAGING" >> $GITHUB_OUTPUT ;;
+            *) echo "role_secret=AWS_ROLE_ARN_DEV" >> $GITHUB_OUTPUT ;;
+          esac
+
+      - name: Configure AWS credentials
+        if: github.event_name != 'pull_request'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[steps.env.outputs.role_secret] }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request'
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Sync extractors
+        run: |
+          echo "Syncing extractors from shared location..."
+          rm -rf modules/chunk_metadata_transformer/src/extractors
+          cp -r modules/bedrock_knowledge_base/s3_vectors/extractors modules/chunk_metadata_transformer/src/extractors
+          find modules/chunk_metadata_transformer/src/extractors -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          echo "Extractors synced successfully"
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+
+          if [ -n "${{ inputs.image_tag }}" ]; then
+            TAG="${{ inputs.image_tag }}"
+          else
+            TAG="sha-${SHORT_SHA}"
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "timestamp=$TIMESTAMP" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            REPO="${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPO_CHUNK_TRANSFORMER || 'chunk-metadata-transformer' }}"
+            TAGS="$REPO:$TAG"
+
+            if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+              TAGS="$TAGS,$REPO:latest"
+            elif [ "${{ github.ref }}" = "refs/heads/staging" ]; then
+              TAGS="$TAGS,$REPO:staging"
+            fi
+
+            echo "tags=$TAGS" >> $GITHUB_OUTPUT
+            echo "repository=$REPO" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: modules/chunk_metadata_transformer
+          file: modules/chunk_metadata_transformer/Dockerfile
+          platforms: linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.meta.outputs.timestamp }}
+            module=chunk_metadata_transformer
+
+      - name: Output image URI
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "## Chunk Metadata Transformer Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Repository | \`${{ steps.meta.outputs.repository }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Full URI | \`${{ steps.meta.outputs.repository }}:${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Usage in Terraform" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`hcl" >> $GITHUB_STEP_SUMMARY
+          echo "module \"chunk_metadata_transformer\" {" >> $GITHUB_STEP_SUMMARY
+          echo "  source = \"./modules/chunk_metadata_transformer\"" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "  image_uri   = \"${{ steps.meta.outputs.repository }}:${{ steps.meta.outputs.tag }}\"" >> $GITHUB_STEP_SUMMARY
+          echo "  build_image = false" >> $GITHUB_STEP_SUMMARY
+          echo "  # ..." >> $GITHUB_STEP_SUMMARY
+          echo "}" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================================
+  # Summary
+  # ============================================================================
+  summary:
+    name: Build Summary
+    needs: [build-preprocessing, build-chunk-transformer]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# Lambda Image Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Module | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| preprocessing_lambda | ${{ needs.build-preprocessing.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| chunk_metadata_transformer | ${{ needs.build-chunk-transformer.result || 'skipped' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
