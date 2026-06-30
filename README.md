@@ -49,6 +49,8 @@ Install the required tools:
 brew install pre-commit terraform-docs tflint
 ```
 
+If on Linux, use your package manager to install these tools.
+
 ### Pre-commit Hooks
 
 ```bash
