@@ -1,4 +1,4 @@
-# AgentCore Agent Module - Main Resources
+# AgentCore Agent Module - Main Resources 
 
 # AgentCore Agent Runtime
 resource "aws_bedrockagentcore_agent_runtime" "agent" {
