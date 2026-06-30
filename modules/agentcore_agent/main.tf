@@ -1,4 +1,4 @@
-# AgentCore Agent Module - Main Resources
+# AgentCore Agent Module - Main Resources 
 
 # AgentCore Agent Runtime
 resource "aws_bedrockagentcore_agent_runtime" "agent" {
@@ -30,6 +30,27 @@ resource "aws_bedrockagentcore_agent_runtime" "agent" {
     for_each = var.server_protocol != null ? [var.server_protocol] : []
     content {
       server_protocol = protocol_configuration.value
+    }
+  }
+
+  # Optional inbound CUSTOM_JWT authorizer (else SigV4/IAM inbound).
+  dynamic "authorizer_configuration" {
+    for_each = var.authorizer_configuration != null ? [var.authorizer_configuration] : []
+    content {
+      custom_jwt_authorizer {
+        discovery_url    = authorizer_configuration.value.discovery_url
+        allowed_audience = authorizer_configuration.value.allowed_audience
+        allowed_clients  = authorizer_configuration.value.allowed_clients
+        allowed_scopes   = authorizer_configuration.value.allowed_scopes
+      }
+    }
+  }
+
+  # Optional allowlist of inbound headers forwarded to the container.
+  dynamic "request_header_configuration" {
+    for_each = length(var.request_header_allowlist) > 0 ? [1] : []
+    content {
+      request_header_allowlist = var.request_header_allowlist
     }
   }
 
