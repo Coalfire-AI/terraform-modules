@@ -79,3 +79,30 @@ variable "endpoints" {
   }))
   default = {}
 }
+
+variable "authorizer_configuration" {
+  description = <<-EOT
+    Optional inbound CUSTOM_JWT authorizer. When set, AgentCore validates the
+    request's bearer JWT (issuer/audience/clients) against discovery_url before
+    it reaches the container. Leave null for SigV4 (IAM) inbound auth.
+  EOT
+  type = object({
+    discovery_url    = string
+    allowed_audience = optional(list(string))
+    allowed_clients  = optional(list(string))
+    allowed_scopes   = optional(list(string))
+  })
+  default = null
+
+  validation {
+    # The provider requires an OIDC discovery document URL.
+    condition     = var.authorizer_configuration == null ? true : endswith(var.authorizer_configuration.discovery_url, ".well-known/openid-configuration")
+    error_message = "authorizer_configuration.discovery_url must end with '.well-known/openid-configuration'."
+  }
+}
+
+variable "request_header_allowlist" {
+  description = "Inbound request headers AgentCore forwards to the container (e.g. [\"Authorization\"] so the runtime can re-verify the bearer). Empty = forward none."
+  type        = list(string)
+  default     = []
+}
